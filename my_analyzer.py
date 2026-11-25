@@ -273,7 +273,27 @@ def build_report(f, scores, stats=None):
     return "\n".join(lines)
 
 
-def facts_to_csv(f, scores, stats=None):
+# The numbers your own model learns from (must match train_my_model.py)
+FEATURES = ["duration", "cuts", "cuts_first_3s", "avg_shot_seconds",
+            "silence_ratio", "mean_volume"]
+MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.joblib")
+
+
+def model_prediction(f):
+    """If you trained a model (model.joblib in this folder), return the chance
+    (0 to 1) that this video looks like a 'winner'. Otherwise return None."""
+    if not os.path.exists(MODEL_FILE):
+        return None
+    try:
+        import joblib
+        model = joblib.load(MODEL_FILE)
+        row = [[f.get(k) if f.get(k) is not None else -30 for k in FEATURES]]
+        return float(model.predict_proba(row)[0][1])
+    except Exception:
+        return None
+
+
+def facts_to_csv(f, scores, stats=None, extra=None):
     """One row of data. Collect many rows, then you can TRAIN your own model."""
     row = {k: v for k, v in f.items()
            if k not in ("transcript", "hook_text", "hook_words_found")}
@@ -281,6 +301,8 @@ def facts_to_csv(f, scores, stats=None):
     if stats:
         for k in ("view_count", "like_count", "comment_count"):
             row[k] = stats.get(k)
+    if extra:
+        row.update(extra)
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=list(row.keys()))
     writer.writeheader()
@@ -295,7 +317,9 @@ def fetch_link(url, folder):
     import yt_dlp
     options = {
         "outtmpl": os.path.join(folder, "video.%(ext)s"),
-        "format": "best[height<=720]/best",
+        # YouTube sends picture and sound separately, so ask for both and join them
+        "format": "bv*[height<=720]+ba/b[height<=720]/b",
+        "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
     }
@@ -315,7 +339,8 @@ def friendly_error(e):
                                "timeout", "network", "name resolution"]):
         return "📡 Internet problem. Check your connection and try again."
     if any(w in text for w in ["unsupported url", "unable to download", "http error",
-                               "could not download", "sign in", "403", "429"]):
+                               "could not download", "sign in", "403", "429",
+                               "requested format", "not available", "bot"]):
         return ("🔗 Could not download that link. Download the video yourself "
                 "and use the upload option instead.")
     if "no such file" in text and "ffmpeg" in text:
@@ -336,6 +361,11 @@ def main():
     url = st.text_input("Video link (YouTube, TikTok, Instagram...)")
     upload = st.file_uploader("...or upload a video file", type=["mp4", "mov", "webm"])
 
+    st.caption("Optional: fill these to build your training data.")
+    views_in = st.number_input("This video's views", min_value=0, step=1, value=0)
+    usual_in = st.number_input("This channel's usual views per video", min_value=0,
+                               step=1, value=0)
+
     if st.button("Analyze 🚀", type="primary"):
         if not url and not upload:
             st.warning("Paste a link or upload a video first.")
@@ -355,8 +385,15 @@ def main():
             cols = st.columns(len(scores))
             for col, (name, value) in zip(cols, scores.items()):
                 col.metric(name, f"{value}/10")
+            chance = model_prediction(facts)
+            if chance is not None:
+                st.info(f"🧠 Your trained model: this video looks "
+                        f"**{chance * 100:.0f}%** like a winner in your niche.")
             st.markdown(build_report(facts, scores, stats))
-            st.download_button("⬇️ Save this data (CSV)", facts_to_csv(facts, scores, stats),
+            views = views_in or (stats or {}).get("view_count") or 0
+            extra = {"views": views, "usual_views": usual_in}
+            st.download_button("⬇️ Save this data (CSV)",
+                               facts_to_csv(facts, scores, stats, extra),
                                file_name="video_data.csv", mime="text/csv")
         except Exception as e:
             st.error(friendly_error(e))
