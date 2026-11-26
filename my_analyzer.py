@@ -1,209 +1,612 @@
+"""
+MY OWN VIDEO ANALYZER  -  no API key, no cloud AI.
+
+How it works (3 steps):
+  1. MEASURE: ffmpeg counts cuts, checks loudness and silence.
+     (Optional) Whisper, a free open-source model, writes down what is said.
+  2. SCORE: simple rules turn the numbers into scores out of 10.
+  3. REPORT: the numbers + scores become a written breakdown.
+
+Every rule is in plain Python below, so you can read it, change it, and
+later replace the rules with a model you train yourself.
+"""
+import base64
+import csv
+import datetime
+import io
+import json
 import os
-import time
+import re
+import subprocess
 import tempfile
 
-import streamlit as st
-import yt_dlp
-from google import genai
-from google.genai import types
+MAX_SECONDS = 180          # only analyze the first 3 minutes (keeps it fast)
 
-# ---------- SETTINGS (you can change these) ----------
-MODEL = "gemini-3.8-flash"   # if you get a "model not found" error, change this name
-FREE_ANALYSES = 2            # free tries per visit
-RETRY_WAITS = [4, 8, 15]     # seconds to wait before retrying when Gemini is busy
-APP_NAME = "Viral Video Analyzer"
-# -----------------------------------------------------
+# ---- PLAN RULES (change these numbers to change your plans) ----
+# The measured report (cuts, volume, scores) is FREE and UNLIMITED: it costs you nothing.
+# The AI coach costs real money or free-key limits, so it has limits:
+FREE_AI_PER_VISIT = 2      # free AI coach runs for each visitor's visit
+FREE_AI_PER_DAY = 40       # free AI coach runs per day shared by ALL visitors
+PAID_AI_PER_VISIT = 30     # AI coach runs per visit for people with an access code
+CUT_SENSITIVITY = 0.30     # lower = more cuts detected, higher = fewer
+HOOK_WORDS = ["why", "how", "never", "stop", "wait", "secret", "nobody",
+              "mistake", "truth", "watch", "free", "worst", "best", "what if",
+              "don't", "dont", "you"]
 
-st.set_page_config(page_title=APP_NAME, page_icon="🔥")
+
+# ---------------------------------------------------------------
+#  STEP 1: MEASURE
+# ---------------------------------------------------------------
+def run_ffmpeg(args):
+    """Run ffmpeg and return everything it printed (its log)."""
+    result = subprocess.run(["ffmpeg", "-hide_banner", "-nostats"] + args,
+                            capture_output=True, text=True)
+    return result.stderr
 
 
-def get_secret(name, default=""):
-    """Read a secret from Streamlit secrets or from environment variables."""
+def probe(path):
+    """Ask ffprobe for duration, size, frame rate and whether there is audio."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json",
+         "-show_format", "-show_streams", path],
+        capture_output=True, text=True).stdout
+    data = json.loads(out or "{}")
+    streams = data.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    duration = float(data.get("format", {}).get("duration", 0) or 0)
+    fps = 0.0
     try:
+        a, b = video.get("r_frame_rate", "0/1").split("/")
+        fps = float(a) / float(b) if float(b) else 0.0
+    except Exception:
+        pass
+    return {
+        "duration": duration,
+        "width": video.get("width", 0),
+        "height": video.get("height", 0),
+        "fps": round(fps, 1),
+        "has_audio": has_audio,
+    }
+
+
+def find_cuts(path):
+    """Return the times (in seconds) where the picture changes sharply."""
+    log = run_ffmpeg(["-i", path, "-t", str(MAX_SECONDS), "-an",
+                      "-vf", f"select='gt(scene,{CUT_SENSITIVITY})',showinfo",
+                      "-f", "null", "-"])
+    return [float(t) for t in re.findall(r"pts_time:([0-9.]+)", log)]
+
+
+def audio_stats(path):
+    """Return average volume, peak volume and how much of the video is silent."""
+    log = run_ffmpeg(["-i", path, "-t", str(MAX_SECONDS), "-vn",
+                      "-af", "volumedetect,silencedetect=noise=-35dB:d=0.4",
+                      "-f", "null", "-"])
+    mean = re.search(r"mean_volume:\s*(-?[0-9.]+)", log)
+    peak = re.search(r"max_volume:\s*(-?[0-9.]+)", log)
+    silent = sum(float(x) for x in re.findall(r"silence_duration:\s*([0-9.]+)", log))
+    return {
+        "mean_volume": float(mean.group(1)) if mean else None,
+        "peak_volume": float(peak.group(1)) if peak else None,
+        "silence_seconds": silent,
+    }
+
+
+_whisper = None
+
+
+def transcribe(path):
+    """Write down the speech with Whisper (free, open source, no key).
+    Returns a list of (start, end, text), or None if Whisper is not installed."""
+    global _whisper
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        return None
+    try:
+        if _whisper is None:
+            _whisper = WhisperModel("tiny", device="cpu", compute_type="int8")
+        segments, _ = _whisper.transcribe(path, vad_filter=True)
+        return [(s.start, s.end, s.text.strip()) for s in segments if s.start < MAX_SECONDS]
+    except Exception:
+        return None
+
+
+def measure(path):
+    """Do all the measuring and return one dictionary of facts."""
+    info = probe(path)
+    length = min(info["duration"], MAX_SECONDS) or 1
+    cuts = find_cuts(path)
+    facts = dict(info)
+    facts["analyzed_seconds"] = round(length, 1)
+    facts["cuts"] = len(cuts)
+    facts["cuts_first_3s"] = sum(1 for t in cuts if t <= 3)
+    facts["avg_shot_seconds"] = round(length / (len(cuts) + 1), 2)
+
+    if info["has_audio"]:
+        facts.update(audio_stats(path))
+        facts["silence_ratio"] = round(facts["silence_seconds"] / length, 2)
+    else:
+        facts.update({"mean_volume": None, "peak_volume": None,
+                      "silence_seconds": 0, "silence_ratio": 0})
+
+    segs = transcribe(path) if info["has_audio"] else None
+    facts["has_transcript"] = segs is not None
+    facts["transcript"] = " ".join(s[2] for s in segs) if segs else ""
+    facts["first_speech_at"] = round(segs[0][0], 1) if segs else None
+    first_8s = " ".join(s[2] for s in segs if s[0] <= 8).lower() if segs else ""
+    facts["hook_text"] = first_8s
+    facts["hook_words_found"] = [w for w in HOOK_WORDS
+                                 if re.search(r"\b" + re.escape(w) + r"\b", first_8s)]
+    facts["hook_has_question"] = "?" in first_8s
+    words = len(facts["transcript"].split())
+    facts["words_per_minute"] = round(words / (length / 60)) if segs and words else None
+    return facts
+
+
+# ---------------------------------------------------------------
+#  STEP 2: SCORE  (these are RULES OF THUMB you can change)
+# ---------------------------------------------------------------
+def score(f):
+    d = f["duration"]
+    if 15 <= d <= 45:
+        length_score = 10
+    elif 10 <= d < 15 or 45 < d <= 60:
+        length_score = 8
+    elif 60 < d <= 90:
+        length_score = 6
+    else:
+        length_score = 4
+
+    s = f["avg_shot_seconds"]
+    if 1 <= s <= 3.5:
+        pace_score = 9
+    elif 0.6 <= s < 1:
+        pace_score = 8
+    elif 3.5 < s <= 6:
+        pace_score = 6
+    else:
+        pace_score = 4
+
+    hook = 4
+    if f["cuts_first_3s"] >= 1:
+        hook += 2
+    if f["has_transcript"]:
+        if f["first_speech_at"] is not None and f["first_speech_at"] <= 1.0:
+            hook += 2
+        if f["hook_words_found"] or f["hook_has_question"]:
+            hook += 2
+    hook = min(hook, 10)
+
+    if not f["has_audio"]:
+        audio = 3
+    else:
+        m = f["mean_volume"]
+        if m is None:
+            audio = 5
+        elif -24 <= m <= -10:
+            audio = 9
+        elif m < -30:
+            audio = 3
+        elif m < -24:
+            audio = 6
+        else:
+            audio = 6
+        if f["silence_ratio"] > 0.35:
+            audio = max(audio - 2, 1)
+
+    return {"Hook": hook, "Pacing": pace_score, "Audio": audio, "Length": length_score}
+
+
+# ---------------------------------------------------------------
+#  STEP 3: REPORT
+# ---------------------------------------------------------------
+def build_report(f, scores, stats=None):
+    lines = []
+    lines.append("## 1. Measured facts")
+    lines.append(f"- Length: **{f['duration']:.0f} s**, {f['width']}x{f['height']}, {f['fps']} fps")
+    lines.append(f"- Cuts: **{f['cuts']}** (about one every **{f['avg_shot_seconds']} s**)")
+    lines.append(f"- Cuts in the first 3 seconds: **{f['cuts_first_3s']}**")
+    if f["has_audio"] and f["mean_volume"] is not None:
+        lines.append(f"- Average volume: **{f['mean_volume']} dB**, silence: "
+                     f"**{int(f['silence_ratio'] * 100)}%** of the video")
+    elif not f["has_audio"]:
+        lines.append("- This video has **no audio**")
+    if f["has_transcript"]:
+        if f["first_speech_at"] is not None:
+            lines.append(f"- First words spoken at **{f['first_speech_at']} s**")
+        if f["words_per_minute"]:
+            lines.append(f"- Speaking speed: **{f['words_per_minute']} words/min**")
+    else:
+        lines.append("- Speech was not transcribed (Whisper is not installed here)")
+
+    if stats:
+        lines.append("")
+        lines.append("## 2. Public numbers")
+        views = stats.get("view_count") or 0
+        likes = stats.get("like_count") or 0
+        comments = stats.get("comment_count") or 0
+        lines.append(f"- Views: **{views:,}**, likes: **{likes:,}**, comments: **{comments:,}**")
+        if views:
+            lines.append(f"- Like rate: **{likes / views * 100:.1f}%**, "
+                         f"comment rate: **{comments / views * 100:.2f}%**")
+            lines.append("- Rule of thumb: a like rate above about 4% means viewers "
+                         "really liked it, not just watched.")
+
+    lines.append("")
+    lines.append("## 3. Scores (out of 10)")
+    for name, value in scores.items():
+        lines.append(f"- **{name}: {value}/10**")
+
+    lines.append("")
+    lines.append("## 4. What the numbers suggest")
+    notes = []
+    if f["cuts_first_3s"] >= 1:
+        notes.append("The picture changes in the first 3 seconds, which helps stop the scroll.")
+    else:
+        notes.append("Nothing changes in the first 3 seconds. Add a cut, zoom or text right at the start.")
+    if f["avg_shot_seconds"] > 6:
+        notes.append("Shots are long (slow pacing). Fast pacing usually holds attention better.")
+    elif f["avg_shot_seconds"] < 0.6:
+        notes.append("Cuts are extremely fast. Make sure viewers can still follow the story.")
+    else:
+        notes.append("The cutting speed is in a healthy range for short videos.")
+    if f["has_transcript"]:
+        if f["hook_words_found"]:
+            notes.append("The opening words use attention words: " + ", ".join(f["hook_words_found"]) + ".")
+        else:
+            notes.append("The opening words use no obvious attention words (why, how, never, stop...).")
+        if f["hook_has_question"]:
+            notes.append("The video opens with a question, which creates curiosity.")
+    if f["has_audio"] and f["silence_ratio"] > 0.35:
+        notes.append("A lot of the video is silent. Dead air loses viewers.")
+    if f["duration"] > 60:
+        notes.append("Long for a short-form video. Under 45 seconds often performs better.")
+    for n in notes:
+        lines.append(f"- {n}")
+
+    target_len = "15-45 seconds" if f["duration"] > 45 else f"about {max(int(f['duration']), 10)} seconds"
+    lines.append("")
+    lines.append("## 5. How to make something similar")
+    lines.append(f"1. Aim for a video of **{target_len}**.")
+    lines.append("2. Start with a hook in the **first 3 seconds**: a question, a bold claim, or a surprising picture.")
+    lines.append(f"3. Cut or change the picture about every **{min(max(f['avg_shot_seconds'], 1), 3.5):.1f} seconds**.")
+    lines.append("4. Start speaking within the first second. No slow intro.")
+    lines.append("5. Keep your voice and music loud and clear, with no long silences.")
+    lines.append("6. End with one clear action: follow, comment, or watch the next video.")
+
+    lines.append("")
+    lines.append("*These are measured facts and simple rules of thumb. This tool does not "
+                 "understand the story or the joke, and it cannot promise a video will go viral.*")
+    return "\n".join(lines)
+
+
+# The numbers your own model learns from (must match train_my_model.py)
+FEATURES = ["duration", "cuts", "cuts_first_3s", "avg_shot_seconds",
+            "silence_ratio", "mean_volume"]
+MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.joblib")
+
+
+def model_prediction(f):
+    """If you trained a model (model.joblib in this folder), return the chance
+    (0 to 1) that this video looks like a 'winner'. Otherwise return None."""
+    if not os.path.exists(MODEL_FILE):
+        return None
+    try:
+        import joblib
+        model = joblib.load(MODEL_FILE)
+        row = [[f.get(k) if f.get(k) is not None else -30 for k in FEATURES]]
+        return float(model.predict_proba(row)[0][1])
+    except Exception:
+        return None
+
+
+def facts_to_csv(f, scores, stats=None, extra=None):
+    """One row of data. Collect many rows, then you can TRAIN your own model."""
+    row = {k: v for k, v in f.items()
+           if k not in ("transcript", "hook_text", "hook_words_found")}
+    row.update({f"score_{k.lower()}": v for k, v in scores.items()})
+    if stats:
+        for k in ("view_count", "like_count", "comment_count"):
+            row[k] = stats.get(k)
+    if extra:
+        row.update(extra)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(row.keys()))
+    writer.writeheader()
+    writer.writerow(row)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------
+#  DOWNLOAD A LINK (needs yt-dlp)
+# ---------------------------------------------------------------
+def fetch_link(url, folder):
+    import yt_dlp
+    options = {
+        "outtmpl": os.path.join(folder, "video.%(ext)s"),
+        # YouTube sends picture and sound separately, so ask for both and join them
+        "format": "bv*[height<=720]+ba/b[height<=720]/b",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+    }
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+    path = next((os.path.join(folder, n) for n in os.listdir(folder)
+                 if n.startswith("video.")), None)
+    if not path:
+        raise RuntimeError("Could not download that video.")
+    stats = {k: info.get(k) for k in ("view_count", "like_count", "comment_count", "title")}
+    return path, stats
+
+
+def friendly_error(e):
+    text = str(e).lower()
+    if any(w in text for w in ["getaddrinfo", "11001", "connection", "timed out",
+                               "timeout", "network", "name resolution"]):
+        return "📡 Internet problem. Check your connection and try again."
+    if any(w in text for w in ["unsupported url", "unable to download", "http error",
+                               "could not download", "sign in", "403", "429",
+                               "requested format", "not available", "bot"]):
+        return ("🔗 Could not download that link. Download the video yourself "
+                "and use the upload option instead.")
+    if "no such file" in text and "ffmpeg" in text:
+        return "🛠️ ffmpeg is not installed on this machine."
+    return "😕 Something went wrong."
+
+
+
+
+def ai_plan_check(is_paid, session_used, global_used):
+    """Decide if the AI coach may run. Returns (allowed, reason_code)."""
+    if is_paid:
+        if session_used >= PAID_AI_PER_VISIT:
+            return False, "paid_visit_limit"
+        return True, ""
+    if session_used >= FREE_AI_PER_VISIT:
+        return False, "free_visit_limit"
+    if global_used >= FREE_AI_PER_DAY:
+        return False, "free_daily_cap"
+    return True, ""
+
+# ---------------------------------------------------------------
+#  OPTIONAL: AI COACH  (uses free AI keys if you add them)
+#  The app tries each AI in order. If one is busy, empty or over its
+#  limit, it moves on to the next. With NO keys the app still works.
+# ---------------------------------------------------------------
+# If you see "model not found", copy the current model name from that
+# provider's model list and paste it in "model" below.
+PROVIDERS = [
+    {"name": "Groq", "key": "GROQ_API_KEY",
+     "url": "https://api.groq.com/openai/v1/chat/completions",
+     "model": "meta-llama/llama-4-scout-17b-16e-instruct", "max_images": 4},
+    {"name": "OpenRouter", "key": "OPENROUTER_API_KEY",
+     "url": "https://openrouter.ai/api/v1/chat/completions",
+     "model": "nvidia/nemotron-nano-12b-v2-vl:free", "max_images": 4},
+    {"name": "Gemini", "key": "GEMINI_API_KEY",
+     "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+     "model": "gemini-3.8-flash", "max_images": 6},
+]
+
+
+def get_secret(name):
+    """Read a key from Streamlit secrets or from environment variables."""
+    try:
+        import streamlit as st
         if name in st.secrets:
             return str(st.secrets[name])
     except Exception:
         pass
-    return os.environ.get(name, default)
+    return os.environ.get(name, "")
 
 
-API_KEY = get_secret("GEMINI_API_KEY")
-PAY_LINK = get_secret("PAY_LINK")
-ACCESS_CODES = [c.strip() for c in get_secret("ACCESS_CODES").split(",") if c.strip()]
-
-PROMPT = """You are an expert short-form video strategist (TikTok, Reels, YouTube Shorts).
-Watch this video carefully, including the audio, on-screen text and editing.
-
-Creator's niche (may be empty): {niche}
-
-Write a clear report with EXACTLY these sections:
-
-## 1. The Hook (first 3 seconds)
-What happens, what is said or shown, and why it stops the scroll.
-
-## 2. Why This Video Works
-Explain the psychology: emotion, curiosity, relatability, trend, controversy, humor, etc.
-Be specific to THIS video. Do not guess view counts or claim certainty.
-
-## 3. Structure Breakdown
-A timeline with approximate timestamps: what happens in each part and its job.
-
-## 4. Editing, Sound and Text
-Pacing, cuts, music, voice, captions, text on screen, visual style.
-
-## 5. Step-by-Step: How To Recreate It
-A numbered list a beginner can follow with just a phone. Include what to film,
-what to say, how to edit it, and what to write in the caption.
-
-## 6. 3 Original Ideas For Your Niche
-Three fresh video ideas using the same viral pattern, each with a hook line.
-
-## 7. Viral Pattern Score
-Give a score out of 10 for: Hook, Emotion, Shareability, Rewatch value.
-Add one sentence for each.
-"""
+def ai_keys_present():
+    return any(get_secret(p["key"]) for p in PROVIDERS)
 
 
-def is_youtube(link):
-    return "youtube.com" in link or "youtu.be" in link
+def grab_frames(path, duration, n=6):
+    """Take n small snapshots spread across the video (as base64 text)."""
+    frames = []
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(n):
+            t = max(duration, 1) * (i + 0.5) / n
+            out = os.path.join(d, f"f{i}.jpg")
+            run_ffmpeg(["-y", "-ss", f"{t:.2f}", "-i", path, "-frames:v", "1",
+                        "-vf", "scale=512:-2", "-q:v", "6", out])
+            if os.path.exists(out):
+                with open(out, "rb") as fh:
+                    frames.append(base64.b64encode(fh.read()).decode())
+    return frames
 
 
-def download_video(url, folder):
-    """Download a video link with yt-dlp and return the file path."""
-    options = {
-        "outtmpl": os.path.join(folder, "video.%(ext)s"),
-        "format": "best[height<=720]/best",
-        "noplaylist": True,
-        "quiet": True,
-        "match_filter": yt_dlp.utils.match_filter_func("duration < 600"),
-    }
-    with yt_dlp.YoutubeDL(options) as ydl:
-        ydl.download([url])
-    for name in os.listdir(folder):
-        if name.startswith("video."):
-            return os.path.join(folder, name)
-    raise RuntimeError("Could not download that video.")
+def build_ai_prompt(f, scores, niche):
+    facts = [
+        f"Length: {f['duration']:.0f} s",
+        f"Cuts: {f['cuts']} (one every {f['avg_shot_seconds']} s), "
+        f"{f['cuts_first_3s']} in the first 3 s",
+    ]
+    if f["has_audio"] and f["mean_volume"] is not None:
+        facts.append(f"Average volume {f['mean_volume']} dB, silence {int(f['silence_ratio'] * 100)}%")
+    if f["has_transcript"]:
+        facts.append("Spoken words: " + f["transcript"][:1500])
+    return (
+        "You are a short-form video coach (TikTok, Reels, Shorts).\n"
+        "You get a few snapshots from one video (in time order) plus measurements made by software.\n"
+        "You did NOT hear the audio or see motion, so say so when it matters. "
+        "Never claim certainty about why a video went viral.\n\n"
+        f"Creator niche: {niche or 'not given'}\n"
+        "Measurements:\n- " + "\n- ".join(facts) + "\n"
+        "Scores (rules of thumb): " + ", ".join(f"{k} {v}/10" for k, v in scores.items()) + "\n\n"
+        "Write a short report with these sections:\n"
+        "1. What the snapshots show (hook, setting, text on screen)\n"
+        "2. Likely reasons it holds attention (mark which are guesses)\n"
+        "3. Step-by-step: how to make a similar video with just a phone\n"
+        "4. Three original video ideas for the creator's niche, each with a hook line\n"
+        "Keep it clear, simple and practical."
+    )
 
 
-def is_busy_error(e):
-    """True when Google's AI is overloaded (temporary, not your fault)."""
-    text = str(e).lower()
-    return any(w in text for w in ["503", "unavailable", "overloaded", "high demand"])
-
-
-def generate(client, contents):
-    """Ask Gemini. If it is busy, wait a little and try again automatically."""
-    for attempt in range(len(RETRY_WAITS) + 1):
+def ask_ai(f, scores, niche, frames):
+    """Try each AI with a key, in order. Returns (name, text, list_of_errors)."""
+    import requests
+    errors = []
+    prompt = build_ai_prompt(f, scores, niche)
+    for p in PROVIDERS:
+        key = get_secret(p["key"])
+        if not key:
+            continue
+        content = [{"type": "text", "text": prompt}]
+        for b64 in frames[:p["max_images"]]:
+            content.append({"type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64," + b64}})
         try:
-            return client.models.generate_content(model=MODEL, contents=contents).text
+            r = requests.post(
+                p["url"],
+                headers={"Authorization": "Bearer " + key},
+                json={"model": p["model"], "max_tokens": 1500,
+                      "messages": [{"role": "user", "content": content}]},
+                timeout=90)
+            if r.status_code != 200:
+                raise RuntimeError(f"{r.status_code} {r.text[:160]}")
+            text = r.json()["choices"][0]["message"]["content"]
+            if not text or not text.strip():
+                raise RuntimeError("empty answer")
+            return p["name"], text, errors
         except Exception as e:
-            if is_busy_error(e) and attempt < len(RETRY_WAITS):
-                time.sleep(RETRY_WAITS[attempt])
-                continue
-            raise
+            errors.append(f"{p['name']}: {e}")
+    return None, None, errors
 
 
-def analyze(client, niche, url=None, file_path=None):
-    """Send the video to Gemini and return the written report."""
-    prompt = PROMPT.format(niche=niche or "not given")
+# ---------------------------------------------------------------
+#  THE WEB PAGE
+# ---------------------------------------------------------------
+def main():
+    import streamlit as st
 
-    # YouTube links can be given to Gemini directly (most reliable)
-    if url and is_youtube(url):
-        contents = [types.Part(file_data=types.FileData(file_uri=url)), prompt]
-        return generate(client, contents)
+    st.set_page_config(page_title="My Video Analyzer", page_icon="🔥")
+    st.title("🔥 My Video Analyzer")
+    st.write("Measured by my own code, with an optional AI coach on top.")
 
-    # Everything else: upload the file to Gemini first
-    video = client.files.upload(file=file_path)
-    while video.state.name == "PROCESSING":
-        time.sleep(3)
-        video = client.files.get(name=video.name)
-    if video.state.name == "FAILED":
-        raise RuntimeError("Gemini could not process this video.")
-    return generate(client, [video, prompt])
+    @st.cache_resource
+    def usage_store():
+        """Counts AI coach runs today for everyone (resets daily or when the app restarts)."""
+        return {"day": "", "count": 0}
 
+    store = usage_store()
+    today = datetime.date.today().isoformat()
+    if store["day"] != today:
+        store["day"], store["count"] = today, 0
+    if "ai_used" not in st.session_state:
+        st.session_state.ai_used = 0
 
-def show_error(e):
-    """Show a clear message that says WHAT kind of problem happened."""
-    text = str(e).lower()
-
-    if is_busy_error(e):
-        st.error("🚦 Google's AI is very busy right now (high demand). This is "
-                 "temporary and not your fault. Wait 1-2 minutes and try again.")
-    elif any(w in text for w in ["getaddrinfo", "11001", "connection", "timed out",
-                               "timeout", "network", "name resolution",
-                               "unreachable", "max retries"]):
-        st.error("📡 Internet problem. Check your connection, turn off any VPN, "
-                 "and try again.")
-    elif "404" in text or "not_found" in text:
-        st.error("⚙️ The AI model name is outdated. Change MODEL at the top of app.py.")
-    elif "429" in text or "quota" in text or "resource_exhausted" in text:
-        st.error("⏳ Too many requests, or the free limit is used up. "
-                 "Wait a minute and try again.")
-    elif "api key" in text or "api_key" in text or "401" in text or "403" in text \
-            or "permission" in text:
-        st.error("🔑 Problem with the API key. Check GEMINI_API_KEY in your secrets.")
-    elif "unsupported url" in text or "unable to download" in text or "yt-dlp" in text \
-            or "http error" in text or "could not download" in text:
-        st.error("🔗 Could not download that link. Download the video yourself "
-                 "and use the upload option instead.")
+    codes = [c.strip() for c in get_secret("ACCESS_CODES").split(",") if c.strip()]
+    pay_link = get_secret("PAY_LINK")
+    code = st.sidebar.text_input("Access code (paid plan)", type="password")
+    is_paid = bool(code) and code in codes
+    if is_paid:
+        st.sidebar.success("Paid plan active ✅")
     else:
-        st.error("Something went wrong. If this was a TikTok/Instagram link, "
-                 "download the video and use the upload option instead.")
+        left = max(FREE_AI_PER_VISIT - st.session_state.ai_used, 0)
+        st.sidebar.info("Free plan\n\n- Measured report: unlimited\n"
+                        f"- AI coach runs left this visit: {left}")
+        if pay_link:
+            st.sidebar.markdown(f"[Get the paid plan]({pay_link})")
 
-    st.caption(str(e))  # the real technical reason, in small grey text
+    niche = st.text_input("Your niche (optional)", placeholder="e.g. comedy, gaming, cooking")
+    url = st.text_input("Video link (YouTube, TikTok, Instagram...)")
+    upload = st.file_uploader("...or upload a video file", type=["mp4", "mov", "webm"])
 
+    st.caption("Optional: fill these to build your training data.")
+    views_in = st.number_input("This video's views", min_value=0, step=1, value=0)
+    usual_in = st.number_input("This channel's usual views per video", min_value=0,
+                               step=1, value=0)
 
-# ---------- PAGE ----------
-st.title(f"🔥 {APP_NAME}")
-st.write("Paste a video link or upload a video. Get a breakdown of why it works "
-         "and a step-by-step plan to make your own.")
-
-if "used" not in st.session_state:
-    st.session_state.used = 0
-
-if not API_KEY:
-    st.error("🔑 Missing GEMINI_API_KEY. Add it in your secrets (see the guide).")
-    st.stop()
-
-code = st.sidebar.text_input("Access code (if you paid)", type="password")
-is_paid = code in ACCESS_CODES and code != ""
-if is_paid:
-    st.sidebar.success("Unlimited access active ✅")
-else:
-    left = max(FREE_ANALYSES - st.session_state.used, 0)
-    st.sidebar.info(f"Free analyses left: {left}")
-
-niche = st.text_input("Your niche (optional)", placeholder="e.g. fitness, comedy, cooking")
-url = st.text_input("Video link (YouTube, TikTok, Instagram...)")
-upload = st.file_uploader("...or upload a video file", type=["mp4", "mov", "webm"])
-
-if st.button("Analyze 🚀", type="primary"):
-    if not url and not upload:
-        st.warning("Paste a link or upload a video first.")
-        st.stop()
-
-    if not is_paid and st.session_state.used >= FREE_ANALYSES:
-        st.warning("You used your free analyses.")
-        if PAY_LINK:
-            st.markdown(f"👉 [Get unlimited access here]({PAY_LINK})")
-        st.stop()
-
-    try:
-        client = genai.Client(api_key=API_KEY)
-        with st.spinner("Watching the video... this can take about a minute"):
-            with tempfile.TemporaryDirectory() as folder:
-                if upload:
-                    path = os.path.join(folder, "video_" + upload.name)
-                    with open(path, "wb") as f:
-                        f.write(upload.getbuffer())
-                    result = analyze(client, niche, file_path=path)
-                elif is_youtube(url):
-                    result = analyze(client, niche, url=url)
+    if st.button("Analyze 🚀", type="primary"):
+        if not url and not upload:
+            st.warning("Paste a link or upload a video first.")
+            st.stop()
+        ai_ok, why = ai_plan_check(is_paid, st.session_state.ai_used, store["count"])
+        try:
+            with st.spinner("Measuring the video..."):
+                with tempfile.TemporaryDirectory() as folder:
+                    stats = None
+                    if upload:
+                        path = os.path.join(folder, "video_" + upload.name)
+                        with open(path, "wb") as f:
+                            f.write(upload.getbuffer())
+                    else:
+                        path, stats = fetch_link(url, folder)
+                    facts = measure(path)
+                    frames = grab_frames(path, facts["duration"]) if (ai_ok and ai_keys_present()) else []
+            scores = score(facts)
+            cols = st.columns(len(scores))
+            for col, (name, value) in zip(cols, scores.items()):
+                col.metric(name, f"{value}/10")
+            chance = model_prediction(facts)
+            if chance is not None:
+                st.info(f"🧠 Your trained model: this video looks "
+                        f"**{chance * 100:.0f}%** like a winner in your niche.")
+            if not ai_keys_present():
+                st.caption("💡 Add a free GROQ_API_KEY in Secrets to turn on the AI coach.")
+            elif not ai_ok:
+                messages = {
+                    "free_visit_limit": "You used your free AI coach runs for this visit.",
+                    "free_daily_cap": "The free AI coach is full for today (shared by everyone). "
+                                      "Come back tomorrow, or get the paid plan.",
+                    "paid_visit_limit": "You reached the AI coach limit for this visit. "
+                                        "Come back a little later.",
+                }
+                st.info("🤖 " + messages.get(why, "AI coach not available.") +
+                        " Your measured report is below.")
+                if pay_link and not is_paid:
+                    st.markdown(f"👉 [Get the paid plan]({pay_link})")
+            else:
+                with st.spinner("AI coach is thinking..."):
+                    who, answer, errs = ask_ai(facts, scores, niche, frames)
+                if answer:
+                    st.session_state.ai_used += 1
+                    if not is_paid:
+                        store["count"] += 1
+                    st.subheader(f"🤖 AI coach (answered by {who})")
+                    st.markdown(answer)
                 else:
-                    path = download_video(url, folder)
-                    result = analyze(client, niche, url=url, file_path=path)
-        st.session_state.used += 1
-        st.markdown(result)
-    except Exception as e:
-        show_error(e)
+                    st.warning("🤖 The AI coach is not available right now "
+                               "(busy or over its free limit). Here is the measured report instead.")
+                for e in errs:
+                    st.caption(e)
+            st.markdown(build_report(facts, scores, stats))
+            views = views_in or (stats or {}).get("view_count") or 0
+            extra = {"views": views, "usual_views": usual_in}
+            st.download_button("⬇️ Save this data (CSV)",
+                               facts_to_csv(facts, scores, stats, extra),
+                               file_name="video_data.csv", mime="text/csv")
+        except Exception as e:
+            st.error(friendly_error(e))
+            st.caption(str(e))
+
+
+def running_in_streamlit():
+    """True when this file is being run as a website by Streamlit."""
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        try:
+            return get_script_run_ctx(suppress_warning=True) is not None
+        except TypeError:
+            return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+
+if running_in_streamlit():
+    main()
+elif __name__ == "__main__":
+    # Quick test without a website:  python my_analyzer.py yourvideo.mp4
+    import sys
+    if len(sys.argv) > 1:
+        facts = measure(sys.argv[1])
+        print(build_report(facts, score(facts)))
+    else:
+        print("Usage: python my_analyzer.py yourvideo.mp4")
 
