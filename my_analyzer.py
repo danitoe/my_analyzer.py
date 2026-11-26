@@ -1,5 +1,5 @@
 """
-MY OWN VIDEO ANALYZER  -  no API key, no cloud AI.
+MY OWN VIDEO ANALYZER  -  accounts, analysis points, history and AI ideas.
 
 How it works (3 steps):
   1. MEASURE: ffmpeg counts cuts, checks loudness and silence.
@@ -13,21 +13,31 @@ later replace the rules with a model you train yourself.
 import base64
 import csv
 import datetime
+import hashlib
+import hmac
 import io
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
+import uuid
 
 MAX_SECONDS = 180          # only analyze the first 3 minutes (keeps it fast)
 
-# ---- PLAN RULES (change these numbers to change your plans) ----
-# The measured report (cuts, volume, scores) is FREE and UNLIMITED: it costs you nothing.
-# The AI coach costs real money or free-key limits, so it has limits:
-FREE_AI_PER_VISIT = 2      # free AI coach runs for each visitor's visit
-FREE_AI_PER_DAY = 40       # free AI coach runs per day shared by ALL visitors
-PAID_AI_PER_VISIT = 30     # AI coach runs per visit for people with an access code
+# ---- PLANS (change these numbers to change your plans) ----
+POINTS_PER_ANALYSIS = 10       # one video analysis costs 10 points
+FREE_AI_PER_DAY = 40           # safety cap: free analyses per day for ALL free users together
+HISTORY_STORE_MAX = 50         # how many analyses are kept per user
+PLANS = {
+    "free":    {"label": "Free",    "points": 20,  "days": 10.5, "history": 2,
+                "ideas": 1, "price": "$0"},
+    "creator": {"label": "Creator", "points": 150, "days": 30,   "history": 30,
+                "ideas": 3, "price": "$9 / month"},
+    "pro":     {"label": "Pro",     "points": 500, "days": 30,   "history": 50,
+                "ideas": 3, "price": "$19 / month"},
+}
 CUT_SENSITIVITY = 0.30     # lower = more cuts detected, higher = fewer
 HOOK_WORDS = ["why", "how", "never", "stop", "wait", "secret", "nobody",
               "mistake", "truth", "watch", "free", "worst", "best", "what if",
@@ -359,18 +369,6 @@ def friendly_error(e):
 
 
 
-def ai_plan_check(is_paid, session_used, global_used):
-    """Decide if the AI coach may run. Returns (allowed, reason_code)."""
-    if is_paid:
-        if session_used >= PAID_AI_PER_VISIT:
-            return False, "paid_visit_limit"
-        return True, ""
-    if session_used >= FREE_AI_PER_VISIT:
-        return False, "free_visit_limit"
-    if global_used >= FREE_AI_PER_DAY:
-        return False, "free_daily_cap"
-    return True, ""
-
 # ---------------------------------------------------------------
 #  OPTIONAL: AI COACH  (uses free AI keys if you add them)
 #  The app tries each AI in order. If one is busy, empty or over its
@@ -421,38 +419,127 @@ def grab_frames(path, duration, n=6):
     return frames
 
 
-def build_ai_prompt(f, scores, niche):
-    facts = [
+def facts_lines(f):
+    """Turn the measured numbers into short lines of text for the AI."""
+    lines = [
         f"Length: {f['duration']:.0f} s",
         f"Cuts: {f['cuts']} (one every {f['avg_shot_seconds']} s), "
         f"{f['cuts_first_3s']} in the first 3 s",
     ]
     if f["has_audio"] and f["mean_volume"] is not None:
-        facts.append(f"Average volume {f['mean_volume']} dB, silence {int(f['silence_ratio'] * 100)}%")
+        lines.append(f"Average volume {f['mean_volume']} dB, silence {int(f['silence_ratio'] * 100)}%")
     if f["has_transcript"]:
-        facts.append("Spoken words: " + f["transcript"][:1500])
+        lines.append("Spoken words: " + f["transcript"][:1500])
+    return lines
+
+
+def build_json_prompt(f, scores, niche):
     return (
         "You are a short-form video coach (TikTok, Reels, Shorts).\n"
         "You get a few snapshots from one video (in time order) plus measurements made by software.\n"
-        "You did NOT hear the audio or see motion, so say so when it matters. "
+        "You did NOT hear the audio or see motion, so be honest about that. "
         "Never claim certainty about why a video went viral.\n\n"
-        f"Creator niche: {niche or 'not given'}\n"
-        "Measurements:\n- " + "\n- ".join(facts) + "\n"
+        f"Creator niche: {niche}\n"
+        "Measurements:\n- " + "\n- ".join(facts_lines(f)) + "\n"
         "Scores (rules of thumb): " + ", ".join(f"{k} {v}/10" for k, v in scores.items()) + "\n\n"
-        "Write a short report with these sections:\n"
-        "1. What the snapshots show (hook, setting, text on screen)\n"
-        "2. Likely reasons it holds attention (mark which are guesses)\n"
-        "3. Step-by-step: how to make a similar video with just a phone\n"
-        "4. Three original video ideas for the creator's niche, each with a hook line\n"
-        "Keep it clear, simple and practical."
+        "Reply with ONLY valid JSON. No markdown fences, no extra words. Use exactly this shape:\n"
+        "{\n"
+        '  "summary": "2 short sentences about what the video is",\n'
+        '  "hook": "what the opening shows and whether it grabs attention",\n'
+        '  "why_it_works": "likely reasons it holds attention (say which are guesses)",\n'
+        '  "structure": "setup, middle, payoff in simple words",\n'
+        '  "recreate_steps": ["step 1", "step 2", "step 3", "step 4", "step 5"],\n'
+        '  "ideas": [\n'
+        "    {\n"
+        '      "title": "a video title for the creator\'s niche",\n'
+        '      "viral_rating": 70,\n'
+        '      "hook_line": "the first sentence to say or show",\n'
+        '      "what_to_film": "exactly what video to make",\n'
+        '      "why_it_could_go_viral": "the reasons this idea can spread",\n'
+        '      "steps": ["step 1", "step 2", "step 3", "step 4"],\n'
+        '      "caption": "a caption with 3 hashtags"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Give EXACTLY 3 different ideas in the ideas list, all fitting the niche.\n"
+        "viral_rating is your honest estimate from 1 to 99. Most ideas deserve 30 to 80. "
+        "Never give a rating above 90.\n"
+        "Write in simple, clear English a beginner understands."
     )
 
 
-def ask_ai(f, scores, niche, frames):
-    """Try each AI with a key, in order. Returns (name, text, list_of_errors)."""
+def _text(value):
+    return str(value).strip() if value is not None else ""
+
+
+def _steps(value):
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [_text(s) for s in value if _text(s)][:8]
+
+
+def clean_ai_data(data):
+    """Check the AI's answer has the shape we need. Returns clean data or None."""
+    if not isinstance(data, dict):
+        return None
+    ideas = data.get("ideas")
+    if not isinstance(ideas, list) or len(ideas) < 3:
+        return None
+    clean_ideas = []
+    for item in ideas[:3]:
+        if not isinstance(item, dict) or not _text(item.get("title")):
+            return None
+        try:
+            rating = int(float(item.get("viral_rating", 50)))
+        except (TypeError, ValueError):
+            rating = 50
+        clean_ideas.append({
+            "title": _text(item["title"])[:120],
+            "viral_rating": max(1, min(rating, 99)),
+            "hook_line": _text(item.get("hook_line")),
+            "what_to_film": _text(item.get("what_to_film")),
+            "why_it_could_go_viral": _text(item.get("why_it_could_go_viral")),
+            "steps": _steps(item.get("steps")),
+            "caption": _text(item.get("caption")),
+        })
+    clean = {
+        "summary": _text(data.get("summary")),
+        "hook": _text(data.get("hook")),
+        "why_it_works": _text(data.get("why_it_works")),
+        "structure": _text(data.get("structure")),
+        "recreate_steps": _steps(data.get("recreate_steps")),
+        "ideas": clean_ideas,
+    }
+    if not (clean["why_it_works"] or clean["summary"]):
+        return None
+    return clean
+
+
+def parse_ai_json(text):
+    """Pull the JSON out of the AI's reply (it sometimes adds extra words)."""
+    if not text:
+        return None
+    t = text.strip()
+    t = re.sub(r"^```(?:json)?", "", t).strip()
+    t = re.sub(r"```$", "", t).strip()
+    start, end = t.find("{"), t.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(t[start:end + 1])
+    except Exception:
+        return None
+    return clean_ai_data(data)
+
+
+def ask_ai_json(f, scores, niche, frames):
+    """Try each AI with a key, in order, until one gives a usable answer.
+    Returns (name, data, list_of_errors). data is None if all failed."""
     import requests
     errors = []
-    prompt = build_ai_prompt(f, scores, niche)
+    prompt = build_json_prompt(f, scores, niche)
     for p in PROVIDERS:
         key = get_secret(p["key"])
         if not key:
@@ -465,126 +552,561 @@ def ask_ai(f, scores, niche, frames):
             r = requests.post(
                 p["url"],
                 headers={"Authorization": "Bearer " + key},
-                json={"model": p["model"], "max_tokens": 1500,
+                json={"model": p["model"], "max_tokens": 3000,
                       "messages": [{"role": "user", "content": content}]},
-                timeout=90)
+                timeout=120)
             if r.status_code != 200:
                 raise RuntimeError(f"{r.status_code} {r.text[:160]}")
             text = r.json()["choices"][0]["message"]["content"]
-            if not text or not text.strip():
-                raise RuntimeError("empty answer")
-            return p["name"], text, errors
+            data = parse_ai_json(text)
+            if data is None:
+                raise RuntimeError("the answer was not in the expected format")
+            return p["name"], data, errors
         except Exception as e:
             errors.append(f"{p['name']}: {e}")
     return None, None, errors
 
 
 # ---------------------------------------------------------------
-#  THE WEB PAGE
+#  DATABASE  (remembers accounts, points and history)
+#  Everything is saved as small JSON "documents" under a key like
+#  "user:someone@email.com". Two versions of the same idea:
+#    SupabaseStore = a real free online database (use this)
+#    LocalStore    = a file next to the app (for testing; it is erased
+#                    when free hosting restarts, so do NOT rely on it)
 # ---------------------------------------------------------------
-def main():
-    import streamlit as st
+class LocalStore:
+    def __init__(self, path=None):
+        base = os.path.dirname(os.path.abspath(__file__))
+        self.path = path or os.path.join(base, "local_data.json")
 
-    st.set_page_config(page_title="My Video Analyzer", page_icon="🔥")
-    st.title("🔥 My Video Analyzer")
-    st.write("Measured by my own code, with an optional AI coach on top.")
+    def _load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
 
-    @st.cache_resource
-    def usage_store():
-        """Counts AI coach runs today for everyone (resets daily or when the app restarts)."""
-        return {"day": "", "count": 0}
+    def get(self, key):
+        return self._load().get(key)
 
-    store = usage_store()
-    today = datetime.date.today().isoformat()
-    if store["day"] != today:
-        store["day"], store["count"] = today, 0
-    if "ai_used" not in st.session_state:
-        st.session_state.ai_used = 0
+    def set(self, key, value):
+        data = self._load()
+        data[key] = value
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
 
-    codes = [c.strip() for c in get_secret("ACCESS_CODES").split(",") if c.strip()]
-    pay_link = get_secret("PAY_LINK")
-    code = st.sidebar.text_input("Access code (paid plan)", type="password")
-    is_paid = bool(code) and code in codes
-    if is_paid:
-        st.sidebar.success("Paid plan active ✅")
+
+class SupabaseStore:
+    def __init__(self, url, key):
+        self.url = url.rstrip("/") + "/rest/v1/app_data"
+        self.headers = {"apikey": key, "Authorization": "Bearer " + key,
+                        "Content-Type": "application/json"}
+
+    def get(self, key):
+        import requests
+        r = requests.get(self.url, headers=self.headers, timeout=20,
+                         params={"key": "eq." + key, "select": "value"})
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0]["value"] if rows else None
+
+    def set(self, key, value):
+        import requests
+        headers = dict(self.headers)
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        r = requests.post(self.url, headers=headers, timeout=20,
+                          json={"key": key, "value": value})
+        r.raise_for_status()
+
+
+def make_store():
+    url, key = get_secret("SUPABASE_URL"), get_secret("SUPABASE_KEY")
+    if url and key:
+        return SupabaseStore(url, key)
+    return LocalStore()
+
+
+# ---------------------------------------------------------------
+#  ACCOUNTS, POINTS, HISTORY  (plain functions, easy to test)
+# ---------------------------------------------------------------
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def to_iso(dt):
+    return dt.isoformat()
+
+
+def from_iso(text):
+    return datetime.datetime.fromisoformat(text)
+
+
+def normalize_email(email):
+    return (email or "").strip().lower()
+
+
+def hash_password(password, salt_hex=None):
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+    return salt.hex(), digest.hex()
+
+
+def user_key(email):
+    return "user:" + email
+
+
+def new_user(email, password, now):
+    salt, pw_hash = hash_password(password)
+    return {"email": email, "salt": salt, "hash": pw_hash, "plan": "free",
+            "points": PLANS["free"]["points"], "reset_at": None,
+            "plan_expires": None, "history": [], "created": to_iso(now)}
+
+
+def signup(store, email, password, now):
+    """Returns (user, error_text)."""
+    email = normalize_email(email)
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return None, "Please enter a valid email."
+    if len(password or "") < 6:
+        return None, "Your password needs at least 6 characters."
+    if store.get(user_key(email)):
+        return None, "This email already has an account. Use Log in."
+    user = new_user(email, password, now)
+    store.set(user_key(email), user)
+    return user, None
+
+
+def login(store, email, password):
+    """Returns (user, error_text)."""
+    email = normalize_email(email)
+    user = store.get(user_key(email)) if email else None
+    if not user:
+        return None, "Wrong email or password."
+    _, pw_hash = hash_password(password or "", user["salt"])
+    if not hmac.compare_digest(pw_hash, user["hash"]):
+        return None, "Wrong email or password."
+    return user, None
+
+
+def refresh_user(user, now):
+    """Apply plan expiry and the free points reset. Returns True if something changed."""
+    changed = False
+    if user["plan"] != "free":
+        expires = user.get("plan_expires")
+        if not expires or now >= from_iso(expires):
+            user.update(plan="free", points=PLANS["free"]["points"],
+                        reset_at=None, plan_expires=None)
+            changed = True
     else:
-        left = max(FREE_AI_PER_VISIT - st.session_state.ai_used, 0)
-        st.sidebar.info("Free plan\n\n- Measured report: unlimited\n"
-                        f"- AI coach runs left this visit: {left}")
-        if pay_link:
-            st.sidebar.markdown(f"[Get the paid plan]({pay_link})")
+        reset_at = user.get("reset_at")
+        if reset_at and now >= from_iso(reset_at):
+            # Always back to exactly the free amount, never more.
+            user["points"] = PLANS["free"]["points"]
+            user["reset_at"] = None
+            changed = True
+    return changed
 
-    niche = st.text_input("Your niche (optional)", placeholder="e.g. comedy, gaming, cooking")
+
+def can_afford(user):
+    return user["points"] >= POINTS_PER_ANALYSIS
+
+
+def spend_points(user, now):
+    user["points"] -= POINTS_PER_ANALYSIS
+    if user["plan"] == "free" and not user.get("reset_at"):
+        # The waiting clock starts the first time points are spent.
+        user["reset_at"] = to_iso(now + datetime.timedelta(days=PLANS["free"]["days"]))
+
+
+def time_left_text(iso_time, now):
+    seconds = int((from_iso(iso_time) - now).total_seconds())
+    if seconds <= 0:
+        return "a moment"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes = rest // 60
+    if days:
+        return f"{days} day{'s' if days != 1 else ''} {hours} h"
+    if hours:
+        return f"{hours} h {minutes} min"
+    return f"{max(minutes, 1)} min"
+
+
+def activate_plan(user, plan, now):
+    info = PLANS[plan]
+    start = now
+    expires = user.get("plan_expires")
+    if user["plan"] == plan and expires and from_iso(expires) > now:
+        start = from_iso(expires)          # renewing: add time on top
+    end = start + datetime.timedelta(days=info["days"])
+    user.update(plan=plan, points=info["points"],
+                plan_expires=to_iso(end), reset_at=to_iso(end))
+
+
+def redeem_code(store, user, code, now):
+    """Turn a code you sold into a plan. Returns (ok, message)."""
+    code = (code or "").strip()
+    if not code:
+        return False, "Type your code first."
+    plan = None
+    for name, secret_name in (("creator", "CREATOR_CODES"), ("pro", "PRO_CODES")):
+        valid = [c.strip() for c in get_secret(secret_name).split(",") if c.strip()]
+        if code in valid:
+            plan = name
+    if not plan:
+        return False, "That code is not valid."
+    if store.get("usedcode:" + code):
+        return False, "That code was already used."
+    activate_plan(user, plan, now)
+    store.set("usedcode:" + code, {"by": user["email"], "at": to_iso(now), "plan": plan})
+    store.set(user_key(user["email"]), user)
+    return True, f"{PLANS[plan]['label']} plan is active for {PLANS[plan]['days']:.0f} days."
+
+
+def make_record(niche, source, facts, scores, report_md, ai, who, chance, now):
+    return {
+        "id": uuid.uuid4().hex[:10],
+        "time": to_iso(now),
+        "niche": niche.strip(),
+        "source": source[:200],
+        "scores": scores,
+        "report_md": report_md,
+        "ai": ai,
+        "answered_by": who,
+        "chance": chance,
+        "free_idx": random.randrange(3),   # the one idea a free user may open
+    }
+
+
+def add_history(user, record):
+    user["history"].insert(0, record)
+    del user["history"][HISTORY_STORE_MAX:]
+
+
+def visible_history(user):
+    """Returns (records the plan may see, how many are hidden)."""
+    allowed = PLANS[user["plan"]]["history"]
+    return user["history"][:allowed], max(len(user["history"]) - allowed, 0)
+
+
+def unlocked_ideas(record, plan):
+    if PLANS[plan]["ideas"] >= 3:
+        return {0, 1, 2}
+    return {record.get("free_idx", 0)}
+
+
+# ---------------------------------------------------------------
+#  THE WEB PAGES
+# ---------------------------------------------------------------
+def render_ideas(st, rec, user, kp):
+    unlocked = unlocked_ideas(rec, user["plan"])
+    ideas = rec["ai"]["ideas"]
+    st.subheader("💡 Video ideas")
+    st.caption("🔥 = viral potential, an AI estimate (not a promise). Tap an idea to open it.")
+    sel_key = f"sel_{kp}_{rec['id']}"
+    for i, idea in enumerate(ideas):
+        lock = "🔒 " if i not in unlocked else ""
+        label = f"{lock}{idea['title']}   🔥 {idea['viral_rating']}%"
+        if st.button(label, key=f"{kp}_{rec['id']}_{i}", use_container_width=True):
+            st.session_state[sel_key] = i
+    chosen = st.session_state.get(sel_key)
+    if chosen is not None:
+        idea = ideas[chosen]
+        if chosen in unlocked:
+            st.markdown(f"### {idea['title']}")
+            st.markdown(f"**Viral potential:** {idea['viral_rating']}% (AI estimate)")
+            if idea["hook_line"]:
+                st.markdown(f"**🎣 Start with:** {idea['hook_line']}")
+            if idea["what_to_film"]:
+                st.markdown(f"**🎬 What to film:** {idea['what_to_film']}")
+            if idea["steps"]:
+                st.markdown("**Steps:**")
+                st.markdown("\n".join(f"{n}. {s}" for n, s in enumerate(idea["steps"], 1)))
+            if idea["why_it_could_go_viral"]:
+                st.markdown(f"**🚀 Why it could go viral:** {idea['why_it_could_go_viral']}")
+            if idea["caption"]:
+                st.markdown(f"**📝 Caption:** {idea['caption']}")
+        else:
+            st.warning("🔒 This idea is locked on the Free plan. "
+                       "Open the 💎 Plans page to unlock all 3 ideas.")
+    if len(unlocked) < len(ideas):
+        st.info("Free plan: 1 of 3 ideas is unlocked for each analysis. "
+                "Upgrade in 💎 Plans to open them all.")
+
+
+def render_analysis(st, rec, user, kp):
+    ai = rec["ai"]
+    st.divider()
+    when = from_iso(rec["time"]).strftime("%d %b %Y %H:%M")
+    st.subheader(f"📊 {rec['niche']}")
+    st.caption(f"{when} · {rec['source']}")
+    cols = st.columns(len(rec["scores"]))
+    for col, (name, value) in zip(cols, rec["scores"].items()):
+        col.metric(name, f"{value}/10")
+    if rec.get("chance") is not None:
+        st.info(f"🧠 Your trained model: this video looks "
+                f"**{rec['chance'] * 100:.0f}%** like a winner in your niche.")
+
+    st.subheader(f"🤖 Why it works (answered by {rec['answered_by']})")
+    if ai["summary"]:
+        st.markdown(ai["summary"])
+    for title, field in (("🎣 The hook", "hook"), ("🧠 Why it works", "why_it_works"),
+                         ("🧱 Structure", "structure")):
+        if ai[field]:
+            st.markdown(f"**{title}**\n\n{ai[field]}")
+    if ai["recreate_steps"]:
+        st.markdown("**🛠️ How to make something similar**")
+        st.markdown("\n".join(f"{n}. {s}" for n, s in enumerate(ai["recreate_steps"], 1)))
+    st.caption("The AI saw a few snapshots and the measured numbers, not the full video or sound.")
+    with st.expander("📏 Measured numbers"):
+        st.markdown(rec["report_md"])
+    render_ideas(st, rec, user, kp)
+
+
+def page_analyze(st, store, user, now, usage):
+    st.title("🔥 My Video Analyzer")
+    niche = st.text_input("Your niche *", placeholder="e.g. comedy, gaming, cooking")
     url = st.text_input("Video link (YouTube, TikTok, Instagram...)")
     upload = st.file_uploader("...or upload a video file", type=["mp4", "mov", "webm"])
 
-    st.caption("Optional: fill these to build your training data.")
-    views_in = st.number_input("This video's views", min_value=0, step=1, value=0)
-    usual_in = st.number_input("This channel's usual views per video", min_value=0,
-                               step=1, value=0)
+    owner_email = normalize_email(get_secret("OWNER_EMAIL"))
+    is_owner = bool(owner_email) and user["email"] == owner_email
+    views_in = usual_in = 0
+    if is_owner:
+        with st.expander("Owner tools (training data)"):
+            views_in = st.number_input("This video's views", min_value=0, step=1, value=0)
+            usual_in = st.number_input("Channel's usual views per video", min_value=0, step=1, value=0)
 
-    if st.button("Analyze 🚀", type="primary"):
+    if st.button(f"Analyze 🚀  ({POINTS_PER_ANALYSIS} points)", type="primary"):
+        if not niche.strip():
+            st.error("Please fill out the niche type")
+            st.stop()
         if not url and not upload:
             st.warning("Paste a link or upload a video first.")
             st.stop()
-        ai_ok, why = ai_plan_check(is_paid, st.session_state.ai_used, store["count"])
+        if not can_afford(user):
+            when = time_left_text(user["reset_at"], now) if user.get("reset_at") else "a while"
+            st.error(f"You have {user['points']} points. One analysis needs "
+                     f"{POINTS_PER_ANALYSIS}. Your points refresh in {when}.")
+            st.info("Or open 💎 Plans to get more points now.")
+            st.stop()
+        if not ai_keys_present():
+            st.error("🤖 The AI is not set up yet. The owner must add an AI key in Secrets.")
+            st.stop()
+        if user["plan"] == "free" and usage["count"] >= FREE_AI_PER_DAY:
+            st.warning("The free analyses are full for today (shared by everyone). "
+                       "Please come back tomorrow, or open 💎 Plans.")
+            st.stop()
+
         try:
             with st.spinner("Measuring the video..."):
                 with tempfile.TemporaryDirectory() as folder:
                     stats = None
                     if upload:
                         path = os.path.join(folder, "video_" + upload.name)
-                        with open(path, "wb") as f:
-                            f.write(upload.getbuffer())
+                        with open(path, "wb") as fh:
+                            fh.write(upload.getbuffer())
+                        source = upload.name
                     else:
                         path, stats = fetch_link(url, folder)
+                        source = url
                     facts = measure(path)
-                    frames = grab_frames(path, facts["duration"]) if (ai_ok and ai_keys_present()) else []
+                    frames = grab_frames(path, facts["duration"])
             scores = score(facts)
-            cols = st.columns(len(scores))
-            for col, (name, value) in zip(cols, scores.items()):
-                col.metric(name, f"{value}/10")
-            chance = model_prediction(facts)
-            if chance is not None:
-                st.info(f"🧠 Your trained model: this video looks "
-                        f"**{chance * 100:.0f}%** like a winner in your niche.")
-            if not ai_keys_present():
-                st.caption("💡 Add a free GROQ_API_KEY in Secrets to turn on the AI coach.")
-            elif not ai_ok:
-                messages = {
-                    "free_visit_limit": "You used your free AI coach runs for this visit.",
-                    "free_daily_cap": "The free AI coach is full for today (shared by everyone). "
-                                      "Come back tomorrow, or get the paid plan.",
-                    "paid_visit_limit": "You reached the AI coach limit for this visit. "
-                                        "Come back a little later.",
-                }
-                st.info("🤖 " + messages.get(why, "AI coach not available.") +
-                        " Your measured report is below.")
-                if pay_link and not is_paid:
-                    st.markdown(f"👉 [Get the paid plan]({pay_link})")
-            else:
-                with st.spinner("AI coach is thinking..."):
-                    who, answer, errs = ask_ai(facts, scores, niche, frames)
-                if answer:
-                    st.session_state.ai_used += 1
-                    if not is_paid:
-                        store["count"] += 1
-                    st.subheader(f"🤖 AI coach (answered by {who})")
-                    st.markdown(answer)
-                else:
-                    st.warning("🤖 The AI coach is not available right now "
-                               "(busy or over its free limit). Here is the measured report instead.")
-                for e in errs:
-                    st.caption(e)
-            st.markdown(build_report(facts, scores, stats))
-            views = views_in or (stats or {}).get("view_count") or 0
-            extra = {"views": views, "usual_views": usual_in}
-            st.download_button("⬇️ Save this data (CSV)",
-                               facts_to_csv(facts, scores, stats, extra),
-                               file_name="video_data.csv", mime="text/csv")
+            with st.spinner("AI coach is thinking... (about a minute)"):
+                who, ai, errs = ask_ai_json(facts, scores, niche.strip(), frames)
         except Exception as e:
             st.error(friendly_error(e))
             st.caption(str(e))
+            st.stop()
+
+        if ai is None:
+            st.warning("🤖 The AI is busy or over its limit right now. "
+                       "**No points were used.** Please try again in a minute.")
+            for e in errs:
+                st.caption(e)
+            st.stop()
+
+        report_md = build_report(facts, scores, stats)
+        record = make_record(niche, source, facts, scores, report_md, ai, who,
+                             model_prediction(facts), now)
+        spend_points(user, now)
+        add_history(user, record)
+        try:
+            store.set(user_key(user["email"]), user)
+        except Exception as e:
+            st.error("Could not save your result. No points were used. Please try again.")
+            st.caption(str(e))
+            st.stop()
+        if user["plan"] == "free":
+            usage["count"] += 1
+        st.session_state.current = record
+        if is_owner:
+            extra = {"views": views_in or (stats or {}).get("view_count") or 0,
+                     "usual_views": usual_in}
+            st.session_state.owner_csv = facts_to_csv(facts, scores, stats, extra)
+        st.rerun()
+
+    rec = st.session_state.get("current")
+    if rec:
+        render_analysis(st, rec, user, "a")
+        if is_owner and st.session_state.get("owner_csv"):
+            st.download_button("⬇️ Save training data (CSV)", st.session_state.owner_csv,
+                               file_name="video_data.csv", mime="text/csv")
+
+
+def page_history(st, user):
+    st.title("🕘 History")
+    plan = PLANS[user["plan"]]
+    if not user["history"]:
+        st.info("No analyses yet. Run your first one in 🔍 Analyze.")
+    else:
+        shown, hidden = visible_history(user)
+        labels = [f"{from_iso(r['time']).strftime('%d %b %H:%M')} · {r['niche']} · {r['source'][:40]}"
+                  for r in shown]
+        pick = st.selectbox("Pick an analysis", range(len(shown)), format_func=lambda i: labels[i])
+        render_analysis(st, shown[pick], user, "h")
+        if hidden:
+            st.warning(f"🔒 {hidden} older analysis{'es' if hidden != 1 else ''} hidden. "
+                       "Upgrade in 💎 Plans to see them.")
+    if user["plan"] == "free":
+        st.info(f"Free plan keeps your last {plan['history']} analyses. "
+                "Upgrade in 💎 Plans to get a longer history "
+                f"(Creator {PLANS['creator']['history']}, Pro {PLANS['pro']['history']}).")
+
+
+def page_plans(st, store, user, now):
+    st.title("💎 Plans")
+    st.write(f"Your plan: **{PLANS[user['plan']]['label']}**  ·  "
+             f"**{user['points']}** points  ·  one analysis = {POINTS_PER_ANALYSIS} points")
+    for key in ("free", "creator", "pro"):
+        p = PLANS[key]
+        every = "every 10.5 days" if key == "free" else "per 30 days"
+        ideas = "1 of 3 ideas open" if p["ideas"] < 3 else "all 3 ideas open"
+        st.markdown(
+            f"### {p['label']} — {p['price']}\n"
+            f"- **{p['points']} points** {every} ({p['points'] // POINTS_PER_ANALYSIS} analyses)\n"
+            f"- History: last **{p['history']}** analyses\n"
+            f"- Ideas: {ideas}")
+        link = get_secret({"creator": "PAY_LINK_CREATOR", "pro": "PAY_LINK_PRO"}.get(key, ""))
+        if link and key != "free":
+            st.markdown(f"👉 [Buy {p['label']}]({link})")
+    st.divider()
+    st.subheader("Have a code?")
+    code = st.text_input("Enter the code you received after paying", key="redeem_code")
+    if st.button("Activate code"):
+        try:
+            ok, msg = redeem_code(store, user, code, now)
+        except Exception as e:
+            ok, msg = False, "Could not reach the database. Try again."
+            st.caption(str(e))
+        (st.success if ok else st.error)(msg)
+        if ok:
+            st.rerun()
+
+
+def login_screen(st, store):
+    st.title("🔥 My Video Analyzer")
+    st.write(f"Create a free account and get **{PLANS['free']['points']} analysis points** "
+             f"(2 video analyses).")
+    tab_in, tab_up = st.tabs(["Log in", "Sign up"])
+    with tab_in:
+        email = st.text_input("Email", key="li_email")
+        password = st.text_input("Password", type="password", key="li_pw")
+        if st.button("Log in", key="li_btn"):
+            try:
+                user, err = login(store, email, password)
+            except Exception as e:
+                user, err = None, "Could not reach the database. Try again."
+                st.caption(str(e))
+            if err:
+                st.error(err)
+            else:
+                st.session_state.email = user["email"]
+                st.rerun()
+    with tab_up:
+        email = st.text_input("Email", key="su_email")
+        password = st.text_input("Choose a password (6+ characters)", type="password", key="su_pw")
+        if st.button("Create my account", key="su_btn"):
+            try:
+                user, err = signup(store, email, password, utcnow())
+            except Exception as e:
+                user, err = None, "Could not reach the database. Try again."
+                st.caption(str(e))
+            if err:
+                st.error(err)
+            else:
+                st.session_state.email = user["email"]
+                st.rerun()
+
+
+def main():
+    import streamlit as st
+
+    st.set_page_config(page_title="My Video Analyzer", page_icon="🔥")
+
+    @st.cache_resource
+    def get_store():
+        return make_store()
+
+    @st.cache_resource
+    def get_usage():
+        """Counts free analyses today for everyone (a safety cap for your wallet)."""
+        return {"day": "", "count": 0}
+
+    store = get_store()
+    usage = get_usage()
+    today = datetime.date.today().isoformat()
+    if usage["day"] != today:
+        usage["day"], usage["count"] = today, 0
+
+    if isinstance(store, LocalStore):
+        st.warning("⚠️ Database not connected. Accounts are TEMPORARY. "
+                   "Add SUPABASE_URL and SUPABASE_KEY in Secrets.")
+
+    if "email" not in st.session_state:
+        login_screen(st, store)
+        st.stop()
+
+    now = utcnow()
+    try:
+        user = store.get(user_key(st.session_state.email))
+    except Exception as e:
+        st.error("Could not reach the database. Please try again in a minute.")
+        st.caption(str(e))
+        st.stop()
+    if not user:
+        del st.session_state["email"]
+        st.rerun()
+    if refresh_user(user, now):
+        store.set(user_key(user["email"]), user)
+
+    # ----- points dashboard (always visible) -----
+    plan = PLANS[user["plan"]]
+    st.sidebar.markdown(f"### 👤 {user['email']}")
+    st.sidebar.metric("Analysis points", f"{user['points']} / {plan['points']}")
+    st.sidebar.progress(min(max(user["points"] / plan["points"], 0.0), 1.0))
+    st.sidebar.caption(f"{plan['label']} plan · "
+                       f"{user['points'] // POINTS_PER_ANALYSIS} analyses left")
+    if user.get("reset_at"):
+        word = "Points refresh in" if user["plan"] == "free" else "Plan ends in"
+        st.sidebar.caption(f"⏳ {word} {time_left_text(user['reset_at'], now)}")
+    elif user["plan"] == "free":
+        st.sidebar.caption("Your points refresh 10.5 days after you first use them.")
+
+    page = st.sidebar.radio("Menu", ["🔍 Analyze", "🕘 History", "💎 Plans"])
+    if st.sidebar.button("Log out"):
+        for k in ("email", "current", "owner_csv"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    if page == "🔍 Analyze":
+        page_analyze(st, store, user, now, usage)
+    elif page == "🕘 History":
+        page_history(st, user)
+    else:
+        page_plans(st, store, user, now)
 
 
 def running_in_streamlit():
@@ -609,4 +1131,4 @@ elif __name__ == "__main__":
         print(build_report(facts, score(facts)))
     else:
         print("Usage: python my_analyzer.py yourvideo.mp4")
-
+ 
