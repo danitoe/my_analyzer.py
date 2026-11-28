@@ -600,8 +600,10 @@ class LocalStore:
 class SupabaseStore:
     def __init__(self, url, key):
         self.url = url.rstrip("/") + "/rest/v1/app_data"
-        self.headers = {"apikey": key, "Authorization": "Bearer " + key,
-                        "Content-Type": "application/json"}
+        self.headers = {"apikey": key, "Content-Type": "application/json"}
+        if key.startswith("eyJ"):
+            # older style keys are long tokens that also go in the Authorization header
+            self.headers["Authorization"] = "Bearer " + key
 
     def get(self, key):
         import requests
@@ -1131,4 +1133,3 @@ elif __name__ == "__main__":
         print(build_report(facts, score(facts)))
     else:
         print("Usage: python my_analyzer.py yourvideo.mp4")
- 
