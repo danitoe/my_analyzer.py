@@ -20,6 +20,7 @@ import json
 import os
 import random
 import re
+import secrets
 import subprocess
 import tempfile
 import uuid
@@ -360,11 +361,20 @@ def friendly_error(e):
     if any(w in text for w in ["unsupported url", "unable to download", "http error",
                                "could not download", "sign in", "403", "429",
                                "requested format", "not available", "bot"]):
-        return ("🔗 Could not download that link. Download the video yourself "
-                "and use the upload option instead.")
+        return ("🔗 This link could not be downloaded (YouTube, TikTok and Instagram often "
+                "block free servers). Please save the video to your phone and use the "
+                "Upload box instead.")
     if "no such file" in text and "ffmpeg" in text:
         return "🛠️ ffmpeg is not installed on this machine."
     return "😕 Something went wrong."
+
+
+def note_error(st, e, visible=False):
+    """Technical error text. Normal users never see it. The owner can see it on
+    screen, and it is always written to the app's log (Manage app -> Logs)."""
+    print("APP ERROR:", e, flush=True)
+    if visible:
+        st.caption(str(e))
 
 
 
@@ -402,6 +412,36 @@ def get_secret(name):
 
 def ai_keys_present():
     return any(get_secret(p["key"]) for p in PROVIDERS)
+
+
+def provider_model(p):
+    """Use the model name from Secrets (e.g. GROQ_MODEL) if you set one, so you
+    can fix a "model not found" error without touching the code."""
+    return get_secret(p["key"].replace("_API_KEY", "_MODEL")) or p["model"]
+
+
+def test_providers():
+    """Send a tiny message to each AI. Returns a list of (name, worked, message)."""
+    import requests
+    results = []
+    for p in PROVIDERS:
+        key = get_secret(p["key"])
+        if not key:
+            results.append((p["name"], False, f"No key found. Add {p['key']} in Secrets."))
+            continue
+        model = provider_model(p)
+        try:
+            r = requests.post(
+                p["url"], headers={"Authorization": "Bearer " + key}, timeout=40,
+                json={"model": model, "max_tokens": 20,
+                      "messages": [{"role": "user", "content": "Reply with the single word OK"}]})
+            if r.status_code == 200:
+                results.append((p["name"], True, f"Key works (model {model})."))
+            else:
+                results.append((p["name"], False, f"Error {r.status_code}: {r.text[:200]}"))
+        except Exception as e:
+            results.append((p["name"], False, f"Could not connect: {e}"))
+    return results
 
 
 def grab_frames(path, duration, n=6):
@@ -552,7 +592,7 @@ def ask_ai_json(f, scores, niche, frames):
             r = requests.post(
                 p["url"],
                 headers={"Authorization": "Bearer " + key},
-                json={"model": p["model"], "max_tokens": 3000,
+                json={"model": provider_model(p), "max_tokens": 3000,
                       "messages": [{"role": "user", "content": content}]},
                 timeout=120)
             if r.status_code != 200:
@@ -766,6 +806,39 @@ def redeem_code(store, user, code, now):
     return True, f"{PLANS[plan]['label']} plan is active for {PLANS[plan]['days']:.0f} days."
 
 
+SESSION_DAYS = 14
+
+
+def _session_key(token):
+    return "session:" + hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_session(store, email, now):
+    """Make a login token. It goes in the page link so a refresh keeps you logged in."""
+    token = secrets.token_urlsafe(24)
+    store.set(_session_key(token), {
+        "email": email,
+        "expires": to_iso(now + datetime.timedelta(days=SESSION_DAYS))})
+    return token
+
+
+def load_session(store, token, now):
+    """Returns the email for a valid token, otherwise None."""
+    if not token:
+        return None
+    doc = store.get(_session_key(token))
+    if not doc or not doc.get("email"):
+        return None
+    if now >= from_iso(doc["expires"]):
+        return None
+    return doc["email"]
+
+
+def end_session(store, token, now):
+    if token:
+        store.set(_session_key(token), {"email": None, "expires": to_iso(now)})
+
+
 def make_record(niche, source, facts, scores, report_md, ai, who, chance, now):
     return {
         "id": uuid.uuid4().hex[:10],
@@ -875,6 +948,15 @@ def page_analyze(st, store, user, now, usage):
     owner_email = normalize_email(get_secret("OWNER_EMAIL"))
     is_owner = bool(owner_email) and user["email"] == owner_email
     views_in = usual_in = 0
+    show_tools = (not owner_email) or is_owner
+    if show_tools and st.checkbox("🔧 Setup check (AI keys)"):
+        if not owner_email:
+            st.caption("This check is visible to everyone until you add OWNER_EMAIL "
+                       "(your own login email) in Secrets.")
+        if st.button("Test my AI keys", key="test_ai_keys"):
+            with st.spinner("Testing..."):
+                for name, good, msg in test_providers():
+                    (st.success if good else st.error)(f"{name}: {msg}")
     if is_owner:
         with st.expander("Owner tools (training data)"):
             views_in = st.number_input("This video's views", min_value=0, step=1, value=0)
@@ -894,7 +976,8 @@ def page_analyze(st, store, user, now, usage):
             st.info("Or open 💎 Plans to get more points now.")
             st.stop()
         if not ai_keys_present():
-            st.error("🤖 The AI is not set up yet. The owner must add an AI key in Secrets.")
+            st.error("🤖 No AI key was found. The owner must add GROQ_API_KEY in "
+                     "Streamlit: your app, Settings, Secrets. Then save and reboot the app.")
             st.stop()
         if user["plan"] == "free" and usage["count"] >= FREE_AI_PER_DAY:
             st.warning("The free analyses are full for today (shared by everyone). "
@@ -920,14 +1003,16 @@ def page_analyze(st, store, user, now, usage):
                 who, ai, errs = ask_ai_json(facts, scores, niche.strip(), frames)
         except Exception as e:
             st.error(friendly_error(e))
-            st.caption(str(e))
+            note_error(st, e, is_owner)
             st.stop()
 
         if ai is None:
             st.warning("🤖 The AI is busy or over its limit right now. "
                        "**No points were used.** Please try again in a minute.")
             for e in errs:
-                st.caption(e)
+                note_error(st, e, is_owner)
+            if show_tools:
+                st.caption("Tick 🔧 Setup check above and tap Test my AI keys to see which key has a problem.")
             st.stop()
 
         report_md = build_report(facts, scores, stats)
@@ -939,7 +1024,7 @@ def page_analyze(st, store, user, now, usage):
             store.set(user_key(user["email"]), user)
         except Exception as e:
             st.error("Could not save your result. No points were used. Please try again.")
-            st.caption(str(e))
+            note_error(st, e, is_owner)
             st.stop()
         if user["plan"] == "free":
             usage["count"] += 1
@@ -1002,7 +1087,7 @@ def page_plans(st, store, user, now):
             ok, msg = redeem_code(store, user, code, now)
         except Exception as e:
             ok, msg = False, "Could not reach the database. Try again."
-            st.caption(str(e))
+            note_error(st, e)
         (st.success if ok else st.error)(msg)
         if ok:
             st.rerun()
@@ -1021,12 +1106,11 @@ def login_screen(st, store):
                 user, err = login(store, email, password)
             except Exception as e:
                 user, err = None, "Could not reach the database. Try again."
-                st.caption(str(e))
+                note_error(st, e)
             if err:
                 st.error(err)
             else:
-                st.session_state.email = user["email"]
-                st.rerun()
+                start_login(st, store, user["email"])
     with tab_up:
         email = st.text_input("Email", key="su_email")
         password = st.text_input("Choose a password (6+ characters)", type="password", key="su_pw")
@@ -1035,12 +1119,21 @@ def login_screen(st, store):
                 user, err = signup(store, email, password, utcnow())
             except Exception as e:
                 user, err = None, "Could not reach the database. Try again."
-                st.caption(str(e))
+                note_error(st, e)
             if err:
                 st.error(err)
             else:
-                st.session_state.email = user["email"]
-                st.rerun()
+                start_login(st, store, user["email"])
+
+
+def start_login(st, store, email):
+    """Log the person in and put a token in the page link so refresh keeps them in."""
+    st.session_state.email = email
+    try:
+        st.query_params["t"] = create_session(store, email, utcnow())
+    except Exception:
+        pass            # they are still logged in, just not after a refresh
+    st.rerun()
 
 
 def main():
@@ -1067,19 +1160,28 @@ def main():
         st.warning("⚠️ Database not connected. Accounts are TEMPORARY. "
                    "Add SUPABASE_URL and SUPABASE_KEY in Secrets.")
 
+    now = utcnow()
+    if "email" not in st.session_state:
+        try:
+            saved_email = load_session(store, st.query_params.get("t"), now)
+        except Exception:
+            saved_email = None
+        if saved_email:
+            st.session_state.email = saved_email
+
     if "email" not in st.session_state:
         login_screen(st, store)
         st.stop()
 
-    now = utcnow()
     try:
         user = store.get(user_key(st.session_state.email))
     except Exception as e:
         st.error("Could not reach the database. Please try again in a minute.")
-        st.caption(str(e))
+        note_error(st, e)
         st.stop()
     if not user:
         del st.session_state["email"]
+        st.query_params.clear()
         st.rerun()
     if refresh_user(user, now):
         store.set(user_key(user["email"]), user)
@@ -1099,6 +1201,11 @@ def main():
 
     page = st.sidebar.radio("Menu", ["🔍 Analyze", "🕘 History", "💎 Plans"])
     if st.sidebar.button("Log out"):
+        try:
+            end_session(store, st.query_params.get("t"), now)
+        except Exception:
+            pass
+        st.query_params.clear()
         for k in ("email", "current", "owner_csv"):
             st.session_state.pop(k, None)
         st.rerun()
